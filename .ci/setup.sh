@@ -14,56 +14,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Setup workflow:
-# 1. setup environment (install qemu, kernel and image)
-# 2. Clone repos, fetch branches, build and install
-
 set -e
 
-cidir=$(dirname "$0")
-source /etc/os-release
+SCRIPT_PATH=$(dirname "$(readlink -f "$0")")
 
-echo "Set up environment"
-if [ "$ID" == fedora ];then
-	bash -f "${cidir}/setup_env_fedora.sh"
-elif [ "$ID" == ubuntu ];then
-	bash -f "${cidir}/setup_env_ubuntu.sh"
-fi
+echo "Install Kubernetes"
+sudo bash -c "cat <<EOF > /etc/apt/sources.list.d/kubernetes.list
+deb http://apt.kubernetes.io/ kubernetes-xenial-unstable main
+EOF"
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+sudo -E apt update
+sudo -E apt install -y docker.io kubelet=1.6.7-00 kubeadm=1.6.7-00 kubectl=1.6.7-00
+sudo -E apt-mark hold kubelet kubeadm kubectl
 
-# This should only run when running tests for a PR
-# since it looks for PULL_REQUEST_NUMBER or LOCALCI_PR_NUMBER environment
-# variable.
-if [ -n "$PULL_REQUEST_NUMBER" ] || [ -n "$LOCALCI_PR_NUMBER" ]; then
-	echo "Building and running the fetch branches tool"
-	bash -f "${cidir}/run_fetch_branches_tool.sh"
-fi
+echo "Install Clear Containers, including dependencies"
+pushd "${SCRIPT_PATH}/../../.ci"
+./setup.sh
+popd
 
+echo "Install runc for CRI-O"
+go get -d github.com/opencontainers/runc
+pushd "${GOPATH}/src/github.com/opencontainers/runc"
+make
+sudo -E install -D -m0755 runc "/usr/local/bin/crio-runc"
+popd
 
-echo "Install shim"
-bash -f ${cidir}/install_shim.sh
+crio_config_file="/etc/crio/crio.conf"
+echo "Set runc as default runtime in CRI-O for trusted workloads"
+sudo sed -i 's/^runtime =.*/runtime = "\/usr\/local\/bin\/crio-runc"/' "$crio_config_file"
 
-echo "Install proxy"
-bash -f ${cidir}/install_proxy.sh
+echo "Set Clear containers as default runtime in CRI-O for untrusted workloads"
+sudo sed -i 's/default_workload_trust = "trusted"/default_workload_trust = "untrusted"/' "$crio_config_file"
+sudo sed -i 's/runtime_untrusted_workload = ""/runtime_untrusted_workload = "\/usr\/local\/bin\/cc-runtime"/' "$crio_config_file"
 
-echo "Install Clear containers image"
-"${cidir}/install_asset.sh" "image" "latest"
-
-echo "Install Clear Containers Kernel"
-"${cidir}/install_asset.sh" "kernel" "latest"
-
-echo "Install runtime"
-bash -f ${cidir}/install_runtime.sh
-
-echo "Install CNI plugins"
-bash -f ${cidir}/install_cni_plugins.sh
-
-echo "Install CRI-O"
-bash -f ${cidir}/install_crio.sh
-
-bash -f "${cidir}/install_kubernetes.sh"
-
-bash -f "${cidir}/openshift_setup.sh"
-
-echo "Drop caches"
-sync
-sudo -E PATH=$PATH bash -c "echo 3 > /proc/sys/vm/drop_caches"
+echo "Modify kubelet systemd configuration to use CRI-O"
+k8s_systemd_file="/etc/systemd/system/kubelet.service.d/10-kubeadm.conf"
+sudo sed -i '/KUBELET_AUTHZ_ARGS/a Environment="KUBELET_EXTRA_ARGS=--container-runtime=remote --container-runtime-endpoint=/var/run/crio.sock --runtime-request-timeout=30m"' "$k8s_systemd_file"
+sudo systemctl daemon-reload
